@@ -565,35 +565,52 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                     None
                 };
 
-                let actual_query = if ext_filter.is_some() { "" } else { query };
-
                 let store = index.read();
                 let start = std::time::Instant::now();
-                let results = search(
-                    &store.entries,
-                    &store.names,
-                    &store.parents,
-                    &store.drive_root,
-                    actual_query,
-                    200,
-                );
-                let elapsed = start.elapsed();
 
-                let results: Vec<_> = results.iter().filter(|r| {
-                    let kind_ok = match filter {
-                        Filter::All   => true,
-                        Filter::Dirs  => r.is_dir,
-                        Filter::Files => !r.is_dir,
-                    };
-                    let ext_ok = match &ext_filter {
-                        None => true,
-                        Some(ext) => r.full_path
-                            .extension()
-                            .map(|e| e.to_string_lossy().to_lowercase() == *ext)
-                            .unwrap_or(false),
-                    };
-                    kind_ok && ext_ok
-                }).take(50).collect();
+                let results: Vec<_> = if let Some(ref ext) = ext_filter {
+                    // Extension-only search: scan all entries directly
+                    use crate::index::search::SearchResult;
+                    store.entries.iter().filter_map(|entry| {
+                        let name = &entry.name_lower;
+                        if !name.ends_with(&format!(".{}", ext)) {
+                            return None;
+                        }
+                        let kind_ok = match filter {
+                            Filter::All   => true,
+                            Filter::Dirs  => matches!(entry.kind, crate::mft::types::FileKind::Directory),
+                            Filter::Files => !matches!(entry.kind, crate::mft::types::FileKind::Directory),
+                        };
+                        if !kind_ok { return None; }
+
+                        let full_path = crate::index::search::build_path(
+                            entry.file_ref, &store.names, &store.parents, &store.drive_root, 0,
+                        );
+                        Some(SearchResult {
+                            full_path,
+                            name: entry.name_original.clone(),
+                            rank: 0,
+                            is_dir: matches!(entry.kind, crate::mft::types::FileKind::Directory),
+                        })
+                    }).take(50).collect()
+                } else {
+                    let raw = search(
+                        &store.entries,
+                        &store.names,
+                        &store.parents,
+                        &store.drive_root,
+                        query,
+                        200,
+                    );
+                    raw.into_iter().filter(|r| {
+                        match filter {
+                            Filter::All   => true,
+                            Filter::Dirs  => r.is_dir,
+                            Filter::Files => !r.is_dir,
+                        }
+                    }).take(50).collect()
+                };
+                let elapsed = start.elapsed();
 
                 if results.is_empty() {
                     println!("  no results for \"{}\"\n", query);

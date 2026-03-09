@@ -115,8 +115,6 @@ impl MftReader {
             let total = leftover + bytes_read as usize;
             let mut offset = 0usize;
 
-            use rayon::prelude::*;
-
             while offset + record_size <= total {
                 let applied =
                     Self::apply_fixup(&mut buffer[offset..offset + record_size], record_size);
@@ -134,22 +132,23 @@ impl MftReader {
                 offset += record_size;
             }
 
-            offset = (total / record_size) * record_size;
+            offset = total - (total % record_size);
 
             leftover = total - offset;
             if leftover > 0 {
-                buffer.copy_within(offset..total, 0);
+                unsafe {
+                    std::ptr::copy(
+                        buffer.as_ptr().add(offset),
+                        buffer.as_mut_ptr(),
+                        leftover,
+                    );
+                }
             }
 
             // for (mut recs, mut names) in results {
             //     records.append(&mut recs);
             //     name_data.append(&mut names);
             // }
-    
-            leftover = total - offset;
-            if leftover > 0 {
-                buffer.copy_within(offset..total, 0);
-            }
         }
 
         unsafe {
@@ -314,88 +313,101 @@ impl MftReader {
     ) {
         let flags = u16::from_le_bytes([record[0x16], record[0x17]]);
         if flags & 0x01 == 0 {
-            return; // not in use
+            return;
         }
-
+    
         let is_dir = flags & 0x02 != 0;
         let seq = u16::from_le_bytes([record[0x10], record[0x11]]) as u64;
         let file_ref = mft_index | (seq << 48);
-
+    
         let first_attr = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
-        let used_size = u32::from_le_bytes(
-            record[0x18..0x1C].try_into().unwrap_or([0; 4]),
-        ) as usize;
-
         let mut aoff = first_attr;
-        while aoff + 4 <= record.len() {
-            let atype = u32::from_le_bytes(
-                record[aoff..aoff + 4].try_into().unwrap_or([0xFF; 4]),
-            );
+    
+        let mut best_ns: u8 = 255;
+        let mut best_name: Option<(usize, usize, u64)> = None;
+    
+        while aoff + 8 <= record.len() {
+            let atype = u32::from_le_bytes(record[aoff..aoff + 4].try_into().unwrap());
+    
             if atype == 0xFFFF_FFFF {
                 break;
             }
-            if aoff + 8 > record.len() {
-                break;
-            }
-            let alen = u32::from_le_bytes(
-                record[aoff + 4..aoff + 8].try_into().unwrap_or([0; 4]),
-            ) as usize;
+    
+            let alen =
+                u32::from_le_bytes(record[aoff + 4..aoff + 8].try_into().unwrap()) as usize;
+    
             if alen == 0 || aoff + alen > record.len() {
                 break;
             }
-
+    
             if atype == 0x30 && record[aoff + 8] == 0 {
-                if aoff + 22 <= record.len() {
-                    let vlen = u32::from_le_bytes(
-                        record[aoff + 16..aoff + 20].try_into().unwrap_or([0; 4]),
-                    ) as usize;
-            
-                    let voff = u16::from_le_bytes([record[aoff + 20], record[aoff + 21]]) as usize;
-                    let vs = aoff + voff;
-            
-                    if vs + 66 <= record.len() && vlen >= 66 {
-                        let parent = u64::from_le_bytes(record[vs..vs + 8].try_into().unwrap());
-            
-                        let nlen = record[vs + 64] as usize;
-                        let ns = record[vs + 65];
-            
-                        if vs + 66 + nlen * 2 <= record.len() {
-            
-                            // skip pure DOS if a better name exists
-                            if ns == 2 && nlen <= 12 {
-                                continue; // skip short 8.3 duplicates
+                let vlen =
+                    u32::from_le_bytes(record[aoff + 16..aoff + 20].try_into().unwrap()) as usize;
+    
+                let voff =
+                    u16::from_le_bytes([record[aoff + 20], record[aoff + 21]]) as usize;
+    
+                let vs = aoff + voff;
+    
+                if vs + 66 <= record.len() && vlen >= 66 {
+                    let parent =
+                        u64::from_le_bytes(record[vs..vs + 8].try_into().unwrap());
+    
+                    let nlen = record[vs + 64] as usize;
+                    let ns = record[vs + 65];
+    
+                    if vs + 66 + nlen * 2 <= record.len() {
+                        if ns == 2 {
+                            continue;
+                        }
+    
+                        let priority = match ns {
+                            1 => 0, // Win32
+                            3 => 1, // Win32 + DOS
+                            0 => 2, // POSIX
+                            _ => 3,
+                        };
+    
+                        if priority < best_ns {
+                            best_ns = priority;
+                            best_name = Some((vs + 66, nlen, parent));
+                        
+                            if priority == 0 {
+                                break; // Win32 name → best possible
                             }
-                                        
-                            let arena_off = name_data.len() as u32;
-            
-                            let name_slice =
-                                &record[vs + 66..vs + 66 + nlen * 2];
-            
-                                let arena_off = name_data.len() as u32;
-
-                                for i in 0..nlen {
-                                    let p = vs + 66 + i * 2;
-                                    name_data.push(u16::from_le_bytes([record[p], record[p + 1]]));
-                                }
-                                
-                                records.push(CompactRecord {
-                                    file_ref,
-                                    parent_ref: parent,
-                                    name_off: arena_off,
-                                    name_len: nlen as u16,
-                                    is_dir,
-                                });
                         }
                     }
                 }
             }
+    
             aoff += alen;
         }
+    
+        if let Some((name_pos, nlen, parent)) = best_name {
+            let arena_off = name_data.len() as u32;
+    
+            for i in 0..nlen {
+                let p = name_pos + i * 2;
+                name_data.push(u16::from_le_bytes([record[p], record[p + 1]]));
+            }
+    
+            records.push(CompactRecord {
+                file_ref,
+                parent_ref: parent,
+                name_off: arena_off,
+                name_len: nlen as u16,
+                is_dir,
+            });
+        }
     }
+
 }
+
 
 impl Drop for MftReader {
     fn drop(&mut self) {
         unsafe { windows::Win32::Foundation::CloseHandle(self.handle).ok() };
     }
 }
+
+

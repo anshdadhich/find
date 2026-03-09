@@ -48,7 +48,7 @@ pub fn search(
     results
 }
 
-fn build_path(
+pub fn build_path(
     file_ref: u64,
     names: &HashMap<u64, String>,
     parents: &HashMap<u64, u64>,
