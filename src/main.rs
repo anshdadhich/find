@@ -516,14 +516,22 @@ fn main() {
 }
 
 fn search_loop(index: Arc<RwLock<IndexStore>>) {
+    let config_path = config_dir().join("config.txt");
+    let mut case_sensitive = false;
+    let mut excluded_dirs: Vec<String> = load_exclusions(&config_path);
+
     println!("Commands:");
-    println!("  <query>        search files");
-    println!("  :<query>       directories only");
-    println!("  !<query>       files only");
-    println!("  *.ext          by extension e.g. *.pdf");
-    println!("  count          total indexed files");
-    println!("  rescan         clear cache and rescan");
-    println!("  quit           exit");
+    println!("  <query>           search files");
+    println!("  folder:<query>    directories only    (or :<query>)");
+    println!("  file:<query>      files only          (or !<query>)");
+    println!("  *.ext / ext:ext   by extension e.g. *.pdf, ext:docx");
+    println!("  case              toggle case sensitivity [off]");
+    println!("  exclude <path>    exclude a directory");
+    println!("  unexclude <path>  remove exclusion");
+    println!("  exclusions        list excluded dirs");
+    println!("  count             total indexed files");
+    println!("  rescan            clear cache and rescan");
+    println!("  quit              exit");
     println!();
 
     loop {
@@ -556,27 +564,71 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                 println!("Cache cleared. Restart fastseek to rescan.\n");
             }
 
-            _ => {
-                let (query, filter) = parse_query(input);
+            "case" => {
+                case_sensitive = !case_sensitive;
+                println!("  case sensitivity: {}\n", if case_sensitive { "ON" } else { "OFF" });
+            }
 
-                let ext_filter: Option<String> = if query.starts_with("*.") {
-                    Some(query[2..].to_lowercase())
+            "exclusions" => {
+                if excluded_dirs.is_empty() {
+                    println!("  no excluded directories\n");
                 } else {
-                    None
+                    println!();
+                    for d in &excluded_dirs {
+                        println!("  - {}", d);
+                    }
+                    println!();
+                }
+            }
+
+            _ if input.starts_with("exclude ") => {
+                let path = input[8..].trim().to_lowercase();
+                if !path.is_empty() {
+                    let path = if path.ends_with('\\') || path.ends_with('/') {
+                        path
+                    } else {
+                        format!("{}\\", path)
+                    };
+                    if !excluded_dirs.contains(&path) {
+                        excluded_dirs.push(path.clone());
+                        save_exclusions(&config_path, &excluded_dirs);
+                    }
+                    println!("  excluded: {}\n", path);
+                }
+            }
+
+            _ if input.starts_with("unexclude ") => {
+                let path = input[10..].trim().to_lowercase();
+                let path = if path.ends_with('\\') || path.ends_with('/') {
+                    path
+                } else {
+                    format!("{}\\", path)
                 };
+                let before = excluded_dirs.len();
+                excluded_dirs.retain(|d| d != &path);
+                save_exclusions(&config_path, &excluded_dirs);
+                if excluded_dirs.len() < before {
+                    println!("  removed: {}\n", path);
+                } else {
+                    println!("  not found in exclusions\n");
+                }
+            }
+
+            _ => {
+                let parsed = parse_query(input);
 
                 let store = index.read();
                 let start = std::time::Instant::now();
 
-                let results: Vec<_> = if let Some(ref ext) = ext_filter {
-                    // Extension-only search: scan all entries directly
+                let results: Vec<_> = if let Some(ref ext) = parsed.ext_filter {
                     use crate::index::search::SearchResult;
+                    let dot_ext = format!(".{}", ext);
                     store.entries.iter().filter_map(|entry| {
                         let name = &entry.name_lower;
-                        if !name.ends_with(&format!(".{}", ext)) {
+                        if !name.ends_with(&dot_ext) {
                             return None;
                         }
-                        let kind_ok = match filter {
+                        let kind_ok = match parsed.filter {
                             Filter::All   => true,
                             Filter::Dirs  => matches!(entry.kind, crate::mft::types::FileKind::Directory),
                             Filter::Files => !matches!(entry.kind, crate::mft::types::FileKind::Directory),
@@ -586,6 +638,17 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                         let full_path = crate::index::search::build_path(
                             entry.file_ref, &store.names, &store.parents, &store.drive_root, 0,
                         );
+
+                        // Check exclusions
+                        if !excluded_dirs.is_empty() {
+                            let path_lower = full_path.to_string_lossy().to_lowercase();
+                            for ex in &excluded_dirs {
+                                if path_lower.starts_with(ex.as_str()) {
+                                    return None;
+                                }
+                            }
+                        }
+
                         Some(SearchResult {
                             full_path,
                             name: entry.name_original.clone(),
@@ -599,11 +662,13 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                         &store.names,
                         &store.parents,
                         &store.drive_root,
-                        query,
+                        parsed.query,
                         200,
+                        case_sensitive,
+                        &excluded_dirs,
                     );
                     raw.into_iter().filter(|r| {
-                        match filter {
+                        match parsed.filter {
                             Filter::All   => true,
                             Filter::Dirs  => r.is_dir,
                             Filter::Files => !r.is_dir,
@@ -613,7 +678,7 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                 let elapsed = start.elapsed();
 
                 if results.is_empty() {
-                    println!("  no results for \"{}\"\n", query);
+                    println!("  no results for \"{}\"\n", input);
                 } else {
                     println!();
                     for (i, r) in results.iter().enumerate() {
@@ -631,10 +696,58 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
 
 enum Filter { All, Dirs, Files }
 
-fn parse_query(input: &str) -> (&str, Filter) {
-    if let Some(q) = input.strip_prefix(':') { (q, Filter::Dirs) }
-    else if let Some(q) = input.strip_prefix('!') { (q, Filter::Files) }
-    else { (input, Filter::All) }
+struct ParsedQuery<'a> {
+    query: &'a str,
+    filter: Filter,
+    ext_filter: Option<String>,
+}
+
+fn parse_query(input: &str) -> ParsedQuery<'_> {
+    // ext:pdf or *.pdf
+    if let Some(ext) = input.strip_prefix("ext:") {
+        return ParsedQuery { query: "", filter: Filter::Files, ext_filter: Some(ext.to_lowercase()) };
+    }
+    if input.starts_with("*.") {
+        return ParsedQuery { query: "", filter: Filter::All, ext_filter: Some(input[2..].to_lowercase()) };
+    }
+    // folder:name / file:name
+    if let Some(q) = input.strip_prefix("folder:") {
+        return ParsedQuery { query: q.trim(), filter: Filter::Dirs, ext_filter: None };
+    }
+    if let Some(q) = input.strip_prefix("file:") {
+        return ParsedQuery { query: q.trim(), filter: Filter::Files, ext_filter: None };
+    }
+    // existing shortcuts
+    if let Some(q) = input.strip_prefix(':') {
+        return ParsedQuery { query: q, filter: Filter::Dirs, ext_filter: None };
+    }
+    if let Some(q) = input.strip_prefix('!') {
+        return ParsedQuery { query: q, filter: Filter::Files, ext_filter: None };
+    }
+    ParsedQuery { query: input, filter: Filter::All, ext_filter: None }
+}
+
+fn config_dir() -> std::path::PathBuf {
+    let dir = std::env::var("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("fastsearch");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn load_exclusions(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn save_exclusions(path: &std::path::Path, dirs: &[String]) {
+    let content: String = dirs.join("\n");
+    let _ = std::fs::write(path, content);
 }
 
 

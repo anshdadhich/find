@@ -2,6 +2,12 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 use crate::index::store::IndexEntry;
 
+const APP_EXTENSIONS: &[&str] = &["exe", "lnk", "msi", "appx", "msix"];
+const APP_PATH_MARKERS: &[&str] = &[
+    "\\program files\\", "\\program files (x86)\\",
+    "\\start menu\\", "\\desktop\\", "\\appdata\\",
+];
+
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub full_path: std::path::PathBuf,
@@ -17,22 +23,55 @@ pub fn search(
     drive_root: &str,
     query: &str,
     limit: usize,
+    case_sensitive: bool,
+    excluded_dirs: &[String],
 ) -> Vec<SearchResult> {
     if query.is_empty() {
         return Vec::new();
     }
 
-    let q = query.to_lowercase();
+    let q = if case_sensitive { query.to_string() } else { query.to_lowercase() };
 
     let mut results: Vec<SearchResult> = entries
         .par_iter()
         .filter_map(|entry| {
-            let rank = if entry.name_lower == q { 0 }
-                else if entry.name_lower.starts_with(&q) { 1 }
-                else if entry.name_lower.contains(&q) { 2 }
+            let name_cmp = if case_sensitive { &entry.name_original } else { &entry.name_lower };
+
+            let base_rank = if *name_cmp == q { 1u8 }
+                else if name_cmp.starts_with(&q) { 2 }
+                else if name_cmp.contains(q.as_str()) { 3 }
                 else { return None; };
 
             let full_path = build_path(entry.file_ref, names, parents, drive_root, 0);
+
+            // Check exclusions
+            if !excluded_dirs.is_empty() {
+                let path_lower = full_path.to_string_lossy().to_lowercase();
+                for ex in excluded_dirs {
+                    if path_lower.starts_with(ex.as_str()) {
+                        return None;
+                    }
+                }
+            }
+
+            // Promote apps (exe/lnk in known app dirs) to rank 0
+            let is_app = if base_rank <= 2 {
+                let ext_is_app = entry.name_lower
+                    .rsplit('.')
+                    .next()
+                    .map(|e| APP_EXTENSIONS.contains(&e))
+                    .unwrap_or(false);
+                if ext_is_app {
+                    let path_lower = full_path.to_string_lossy().to_lowercase();
+                    APP_PATH_MARKERS.iter().any(|m| path_lower.contains(m))
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let rank = if is_app { 0 } else { base_rank };
 
             Some(SearchResult {
                 full_path,
